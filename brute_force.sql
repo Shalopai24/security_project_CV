@@ -19,5 +19,5 @@ first_alert AS (
 )
 SELECT ip, user, timestamp, attempts_in_window
 FROM first_alert
-WHERE rn = 1  -- только первый момент превышения порога
+WHERE rn = 1  
 ORDER BY timestamp;

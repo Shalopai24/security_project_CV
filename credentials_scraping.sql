@@ -3,7 +3,7 @@ WITH time_filtered AS (
     FROM logs
     WHERE 
         success = 0
-        AND timestamp >= NOW() - INTERVAL '1 hour'  -- анализируем последний час
+        AND timestamp >= NOW() - INTERVAL '1 hour'  
 ),
 ip_stats AS (
     SELECT 
