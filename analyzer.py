@@ -1,46 +1,91 @@
 import pandas as pd
+import sys
 
-#Reading logs
-df = pd.read_csv("logs.csv")
-
-#Converting Timestamp
-df['timestamp'] = pd.to_datetime(df['timestamp'])
-
-#We need only failed logins(in case if it's a WiFi with multiple users)
-df = df[df['success'] == 0]
-
-#Some Settings
-BRUTE_FORCE_THRESHOLD = 5       
-CRED_STUFF_THRESHOLD_USERS = 5  
+#Config 
+BRUTE_FORCE_THRESHOLD      = 5
+CRED_STUFF_THRESHOLD_USERS = 5
 CRED_STUFF_THRESHOLD_TOTAL = 10
-TIME_WINDOW = '1T' #Explanation: 5 attempts in 1 month is not a brute force      
+BOT_REQUEST_THRESHOLD      = 20
+TIME_WINDOW                = '60s'  
+LOG_FILE                   = 'logs.csv'
+REQUIRED_COLUMNS           = {'timestamp', 'ip', 'user', 'user_agent', 'endpoint', 'success'}
 
-#Index
-df = df.set_index('timestamp')
-#Attempts per user in a timestamp (brute force detection)
-bf_window = df.groupby(['ip','user']).resample(TIME_WINDOW).size().reset_index(name='attempts')
-brute_force = bf_window[bf_window['attempts'] > BRUTE_FORCE_THRESHOLD]
+#Load & validate
+def load_logs(path):
+    try:
+        df = pd.read_csv(path)
+    except FileNotFoundError:
+        sys.exit(f"[ERROR] File not found: {path}")
 
-print("Brute Force Detected:")
-print(brute_force)
+    missing = REQUIRED_COLUMNS - set(df.columns)
+    if missing:
+        sys.exit(f"[ERROR] Missing columns: {missing}")
 
-#Amount of unique users and attempts per each user (credential stuffing)
-cs_window = df.groupby('ip').resample(TIME_WINDOW).agg(
-    unique_users=('user', 'nunique'),
-    total_attempts=('user', 'count')
-).reset_index()
-credential_stuffing = cs_window[
-    (cs_window['unique_users'] > CRED_STUFF_THRESHOLD_USERS) &
-    (cs_window['total_attempts'] > CRED_STUFF_THRESHOLD_TOTAL)
-]
+    df['timestamp'] = pd.to_datetime(df['timestamp'], errors='coerce')
+    dropped = df['timestamp'].isna().sum()
+    if dropped:
+        print(f"[WARN] Dropped {dropped} rows with invalid timestamps")
+    df = df.dropna(subset=['timestamp'])
 
-print("Credential Stuffing Detected:")
-print(credential_stuffing)
+    return df
 
-#grouping by IP, user-agent, enpoint and looking for suspicious activities (bot detection)
-bot_activity = df.groupby(['ip','user_agent','endpoint']).resample(TIME_WINDOW).size().reset_index(name='requests')
-BOT_REQUEST_THRESHOLD = 20
-bot_suspect = bot_activity[bot_activity['requests'] > BOT_REQUEST_THRESHOLD]
+#Detectors 
+def detect_brute_force(df):
+    failed = df[df['success'] == 0].copy()
+    failed = failed.sort_values('timestamp')
+    window = (
+        failed.groupby(['ip', 'user'])
+        .rolling(TIME_WINDOW, on='timestamp')['success']
+        .count()
+        .reset_index()
+        .rename(columns={'success': 'attempts'})
+    )
+    alerts = window[window['attempts'] > BRUTE_FORCE_THRESHOLD]
+    return alerts.groupby(['ip', 'user']).first().reset_index()
 
-print("Possible Bot Activity Detected:")
-print(bot_suspect)
+def detect_credential_stuffing(df):
+    failed = df[df['success'] == 0].copy()
+    failed = failed.set_index('timestamp')
+    window = (
+        failed.groupby('ip')[['user']]
+        .resample('60s') #.rolling doesn't work with 'nunique' - fixed in streaming version
+        .agg(unique_users=('user', 'nunique'), total_attempts=('user', 'count'))
+        .reset_index()
+    )
+    return window[
+        (window['unique_users'] > CRED_STUFF_THRESHOLD_USERS) &
+        (window['total_attempts'] > CRED_STUFF_THRESHOLD_TOTAL)
+    ][['ip', 'timestamp', 'unique_users', 'total_attempts']]
+
+def detect_bots(df):
+    df = df.sort_values('timestamp')
+    window = (
+        df.groupby(['ip', 'user_agent', 'endpoint'])
+        .rolling(TIME_WINDOW, on='timestamp')['success']
+        .count()
+        .reset_index()
+        .rename(columns={'success': 'requests'})
+    )
+    alerts = window[window['requests'] > BOT_REQUEST_THRESHOLD]
+    return alerts.groupby(['ip', 'user_agent', 'endpoint']).first().reset_index()[
+        ['ip', 'user_agent', 'endpoint', 'timestamp', 'requests']
+    ]
+
+#Report
+def report(label, df):
+    print(f"\n{'='*50}")
+    print(f"  {label}: {len(df)} alert(s)")
+    print('='*50)
+    if df.empty:
+        print("  No threats detected.")
+    else:
+        print(df.to_string(index=False))
+
+#Main
+if __name__ == '__main__':
+    df = load_logs(LOG_FILE)
+    print(f"[INFO] Loaded {len(df)} valid log entries")
+
+    report("Brute Force",         detect_brute_force(df))
+    report("Credential Stuffing", detect_credential_stuffing(df))
+    report("Bot Activity",        detect_bots(df))
